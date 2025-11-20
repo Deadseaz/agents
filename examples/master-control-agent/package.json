@@ -1,0 +1,29 @@
+{
+  "name": "master-control-agent",
+  "version": "1.0.0",
+  "description": "Autonomous Master Control Agent for managing infrastructure, services, and subagents",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/agents": "workspace:*",
+    "@ai-sdk/anthropic": "^2.0.41",
+    "ai": "^5.0.89",
+    "nanoid": "^5.0.7",
+    "zod": "^3.25.76",
+    "partyserver": "^0.0.75",
+    "@modelcontextprotocol/sdk": "^1.21.0",
+    "cron-schedule": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251106.1",
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.46.0"
+  }
+}

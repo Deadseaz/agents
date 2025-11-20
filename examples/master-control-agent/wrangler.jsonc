@@ -1,0 +1,91 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "master-control-agent",
+  "main": "src/server.ts",
+  "compatibility_date": "2025-02-19",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "nodejs_compat_populate_process_env"
+  ],
+  "assets": {
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "MasterControlAgent",
+        "name": "MasterControlAgent"
+      },
+      {
+        "class_name": "WorkerSubagent",
+        "name": "WorkerSubagent"
+      },
+      {
+        "class_name": "SpecialistSubagent",
+        "name": "SpecialistSubagent"
+      },
+      {
+        "class_name": "MCPServerInstance",
+        "name": "MCPServerInstance"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": [
+        "MasterControlAgent",
+        "WorkerSubagent",
+        "SpecialistSubagent",
+        "MCPServerInstance"
+      ],
+      "tag": "v1"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "master-control-agent-storage"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "master-control-agent-db",
+      "database_id": "YOUR_D1_DATABASE_ID"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "master-control-agent-vectors"
+    }
+  ],
+  "queues": [
+    {
+      "binding": "QUEUE",
+      "queue": "master-control-agent-queue"
+    }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "ANALYTICS"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "LOG_LEVEL": "info"
+  }
+}
