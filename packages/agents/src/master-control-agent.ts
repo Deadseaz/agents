@@ -1,5 +1,6 @@
-import { Agent, callable } from "./index";
 import { McpAgent } from "./mcp";
+import type { TransportType } from "./mcp/types";
+import { Agent } from "./index";
 import {
   MasterControlKnowledgeBase,
   type KnowledgeEntry,
@@ -33,6 +34,7 @@ import {
   type ErrorCategory,
   type ErrorSeverity
 } from "./master-control-errors";
+import { callable } from "./index";
 
 /**
  * Security context for Zero Trust operations
@@ -128,7 +130,7 @@ export class MasterControlAgent extends McpAgent<
         }
       };
 
-      // Initialize knowledge base with some default entries
+      // Initialize knowledge base with default entries
       await this.initializeKnowledgeBase();
 
       // Initialize MCP hub with default servers
@@ -310,152 +312,19 @@ export class MasterControlAgent extends McpAgent<
    * Authenticate a user with username and password
    */
   @callable({ description: "Authenticate a user with username and password" })
-  async authenticateUser(params: {
-    username: string;
-    password: string;
-    ipAddress?: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    token?: string;
-    userId?: string;
-    permissions?: Permission[];
-  }> {
-    try {
-      // Record authentication attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "authenticate_user" }
-      });
-
-      // Authenticate user through auth system
-      const result = await this.auth.authenticateUser(params);
-
-      // Record authentication result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "authenticate_user_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "authenticate_user_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `User authentication attempt for: ${params.username}`,
-        payload: {
-          url: "authentication",
-          transport: "internal",
-          state: result.success ? "success" : "failed",
-          username: params.username
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "authenticate_user_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "User authentication failed",
-        "USER_AUTHENTICATION_FAILED",
-        "authentication",
-        "high",
-        { username: params.username }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Authentication failed: Internal error"
-      };
-    }
+  private async authenticate(
+    username: string,
+    password: string
+  ): Promise<AuthenticationResult> {
+    return this.auth.authenticate(username, password);
   }
 
   /**
    * Validate an authentication token
    */
   @callable({ description: "Validate an authentication token" })
-  async validateToken(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    userId?: string;
-    permissions?: Permission[];
-  }> {
-    try {
-      // Record token validation attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "validate_token" }
-      });
-
-      // Validate token through auth system
-      const result = await this.auth.validateToken(params);
-
-      // Record validation result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "validate_token_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "validate_token_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Token validation attempt",
-        payload: {
-          url: "token-validation",
-          transport: "internal",
-          state: result.success ? "success" : "failed"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "validate_token_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Token validation failed",
-        "TOKEN_VALIDATION_FAILED",
-        "authentication",
-        "high",
-        { token: params.token.substring(0, 10) + "..." } // Only log first 10 chars for security
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Token validation failed: Internal error"
-      };
-    }
+  private async validateToken(token: string): Promise<AuthenticationResult> {
+    return this.auth.validateToken(token);
   }
 
   /**
@@ -592,312 +461,26 @@ export class MasterControlAgent extends McpAgent<
    * Connect to an MCP server
    */
   @callable({ description: "Connect to an MCP server" })
-  async connectToMcpServer(params: {
-    serverId: string;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Record connection attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "connect_mcp_server" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "connect_mcp_server_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("mcp-management")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "connect_mcp_server_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to connect to MCP servers"
-        };
-      }
-
-      // Connect to server through MCP hub
-      const result = await this.mcpHub.connectToServer({
-        serverId: params.serverId
-      });
-
-      // Record connection result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "connect_mcp_server_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "connect_mcp_server_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Connected to MCP server: ${params.serverId}`,
-        payload: {
-          url: "mcp-connection",
-          transport: "internal",
-          state: result.success ? "connected" : "error",
-          serverId: params.serverId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "connect_mcp_server_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "MCP server connection failed",
-        "MCP_SERVER_CONNECTION_FAILED",
-        "mcp",
-        "high",
-        { serverId: params.serverId }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to connect to MCP server"
-      };
-    }
+  private async connectToMCP(serverId: string): Promise<MCPConnectionResult> {
+    return this.mcpHub.connectToMCP(serverId);
   }
 
   /**
    * Disconnect from an MCP server
    */
   @callable({ description: "Disconnect from an MCP server" })
-  async disconnectFromMcpServer(params: {
-    serverId: string;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Record disconnection attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "disconnect_mcp_server" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "disconnect_mcp_server_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("mcp-management")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "disconnect_mcp_server_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to disconnect from MCP servers"
-        };
-      }
-
-      // Disconnect from server through MCP hub
-      const result = await this.mcpHub.disconnectFromServer({
-        serverId: params.serverId
-      });
-
-      // Record disconnection result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "disconnect_mcp_server_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "disconnect_mcp_server_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Disconnected from MCP server: ${params.serverId}`,
-        payload: {
-          url: "mcp-disconnection",
-          transport: "internal",
-          state: result.success ? "disconnected" : "error",
-          serverId: params.serverId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "disconnect_mcp_server_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "MCP server disconnection failed",
-        "MCP_SERVER_DISCONNECTION_FAILED",
-        "mcp",
-        "high",
-        { serverId: params.serverId }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to disconnect from MCP server"
-      };
-    }
+  private async disconnectFromMCP(
+    serverId: string
+  ): Promise<MCPDisconnectionResult> {
+    return this.mcpHub.disconnectFromMCP(serverId);
   }
 
   /**
    * List all registered MCP servers
    */
   @callable({ description: "List all registered MCP servers" })
-  async listMcpServers(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    servers?: MCPServerInfo[];
-  }> {
-    try {
-      // Record listing attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "list_mcp_servers" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_mcp_servers_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("mcp-management")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_mcp_servers_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to list MCP servers"
-        };
-      }
-
-      // Get servers from MCP hub
-      const result = await this.mcpHub.listServers();
-
-      // Record listing result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "list_mcp_servers_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_mcp_servers_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Retrieved list of MCP servers",
-        payload: {
-          url: "mcp-servers",
-          transport: "internal",
-          state: result.success ? "retrieved" : "error"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "list_mcp_servers_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to list MCP servers",
-        "MCP_SERVERS_LIST_FAILED",
-        "mcp",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve list of MCP servers"
-      };
-    }
+  private async listMCPServers(): Promise<MCPListResult> {
+    return this.mcpHub.listMCPServers();
   }
 
   /**
@@ -1010,2249 +593,700 @@ export class MasterControlAgent extends McpAgent<
   }
 
   /**
+   * Execute a command on an MCP server
+   */
+  @callable({
+    description: "Execute a command on an MCP server",
+    streaming: true
+  })
+  private async executeMCPCommand(
+    serverId: string,
+    command: string,
+    args: unknown[]
+  ): Promise<MCPCommandResult> {
+    return this.mcpHub.executeMCPCommand(serverId, command, args);
+  }
+
+  /**
    * Get current system status
    */
   @callable({ description: "Get current system status" })
-  async getSystemStatus(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    status?: {
-      securityLevel: string;
-      activeServers: number;
-      lastAudit: number;
-      uptime: number;
-    };
-  }> {
-    try {
-      // Record status request
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "get_system_status" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_system_status_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_system_status_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to get system status"
-        };
-      }
-
-      const currentState = this.state || {
-        securityLevel: "high",
-        activeServers: [],
-        lastAudit: Date.now(),
-        config: {}
-      };
-
-      // Record successful status retrieval
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "get_system_status_success" }
-      });
-
-      return {
-        success: true,
-        message: "System status retrieved",
-        status: {
-          securityLevel: currentState.securityLevel,
-          activeServers: currentState.activeServers.length,
-          lastAudit: currentState.lastAudit,
-          uptime: Date.now() - currentState.lastAudit
-        }
-      };
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "get_system_status_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve system status",
-        "SYSTEM_STATUS_RETRIEVAL_FAILED",
-        "system",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve system status"
-      };
-    }
+  private async getSystemStatus(): Promise<SystemStatus> {
+    return this.monitoring.getSystemStatus();
   }
 
   /**
    * Perform a security audit
    */
   @callable({ description: "Perform a security audit" })
-  async performSecurityAudit(params: {
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Record audit attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "perform_security_audit" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "perform_security_audit_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (
-        !tokenValidation.permissions?.includes("security") ||
-        !tokenValidation.permissions?.includes("audit")
-      ) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "perform_security_audit_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to perform security audit"
-        };
-      }
-
-      // Update last audit timestamp
-      const currentState = this.state || {
-        securityLevel: "high",
-        activeServers: [],
-        lastAudit: Date.now(),
-        config: {}
-      };
-
-      currentState.lastAudit = Date.now();
-      this.setState(currentState);
-
-      // Record successful audit
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "perform_security_audit_success" }
-      });
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Security audit completed",
-        payload: {
-          url: "security-audit",
-          transport: "internal",
-          state: "completed",
-          timestamp: Date.now()
-        },
-        timestamp: Date.now()
-      });
-
-      return {
-        success: true,
-        message: "Security audit completed successfully"
-      };
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "perform_security_audit_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Security audit failed",
-        "SECURITY_AUDIT_FAILED",
-        "security",
-        "high"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to perform security audit"
-      };
-    }
+  private async performSecurityAudit(): Promise<SecurityAuditResult> {
+    return this.monitoring.performSecurityAudit();
   }
 
   /**
    * Add a new entry to the knowledge base
    */
-  @callable({ description: "Add a new entry to the knowledge base" })
-  async addKnowledgeEntry(params: {
-    title: string;
-    content: string;
-    tags?: string[];
-    metadata?: Record<string, unknown>;
-    token: string;
-  }): Promise<{ success: boolean; message: string; entryId?: string }> {
-    try {
-      // Record knowledge base addition attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "add_knowledge_entry" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "add_knowledge_entry_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("knowledge-base")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "add_knowledge_entry_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to add knowledge base entries"
-        };
-      }
-
-      // Add entry to knowledge base
-      const result = await this.knowledgeBase.addEntry({
-        title: params.title,
-        content: params.content,
-        tags: params.tags,
-        metadata: params.metadata
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "add_knowledge_entry_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "add_knowledge_entry_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Knowledge entry added: ${params.title}`,
-        payload: {
-          url: "knowledge-base",
-          transport: "internal",
-          state: "added",
-          title: params.title
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "add_knowledge_entry_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to add knowledge base entry",
-        "KNOWLEDGE_ENTRY_ADD_FAILED",
-        "knowledge",
-        "medium",
-        { title: params.title }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to add entry to knowledge base"
-      };
-    }
+  @callable({
+    description: "Add a new entry to the knowledge base"
+  })
+  private async addKnowledgeEntry(
+    entry: KnowledgeEntry
+  ): Promise<KnowledgeBaseResult> {
+    return this.knowledgeBase.addEntry(entry);
   }
 
   /**
    * Search the knowledge base
    */
-  @callable({ description: "Search the knowledge base" })
-  async searchKnowledgeBase(
-    params: KnowledgeQuery & { token: string }
-  ): Promise<{
-    success: boolean;
-    message: string;
-    entries?: KnowledgeEntry[];
-    total?: number;
-  }> {
-    try {
-      // Record knowledge base search attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "search_knowledge_base" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "search_knowledge_base_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("knowledge-base")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "search_knowledge_base_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to search knowledge base"
-        };
-      }
-
-      // Search knowledge base
-      const result = await this.knowledgeBase.searchEntries(params);
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "search_knowledge_base_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "search_knowledge_base_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Knowledge base searched",
-        payload: {
-          url: "knowledge-base",
-          transport: "internal",
-          state: "searched",
-          query: params.query,
-          tags: params.tags
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "search_knowledge_base_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to search knowledge base",
-        "KNOWLEDGE_BASE_SEARCH_FAILED",
-        "knowledge",
-        "medium",
-        { query: params.query, tags: params.tags }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to search knowledge base"
-      };
-    }
+  @callable({
+    description: "Search the knowledge base"
+  })
+  private async searchKnowledgeBase(
+    query: string
+  ): Promise<KnowledgeBaseSearchResult> {
+    return this.knowledgeBase.search(query);
   }
 
   /**
    * Get knowledge base statistics
    */
-  @callable({ description: "Get knowledge base statistics" })
-  async getKnowledgeBaseStats(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    stats?: {
-      totalEntries: number;
-      totalTags: number;
-      mostUsedTags: { tag: string; count: number }[];
-    };
-  }> {
-    try {
-      // Record knowledge base stats request
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "get_knowledge_base_stats" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_knowledge_base_stats_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("knowledge-base")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_knowledge_base_stats_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to get knowledge base statistics"
-        };
-      }
-
-      // Get knowledge base statistics
-      const result = await this.knowledgeBase.getStatistics();
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "get_knowledge_base_stats_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_knowledge_base_stats_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Knowledge base statistics retrieved",
-        payload: {
-          url: "knowledge-base",
-          transport: "internal",
-          state: "stats-retrieved"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      await this.monitoring.incrementCounter({
-        metricId: "errors_total",
-        incrementBy: 1,
-        labels: { operation: "get_knowledge_base_stats_error" }
-      });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve knowledge base statistics",
-        "KNOWLEDGE_BASE_STATS_FAILED",
-        "knowledge",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve knowledge base statistics"
-      };
-    }
+  @callable({
+    description: "Get knowledge base statistics"
+  })
+  private async getKnowledgeBaseStats(): Promise<KnowledgeBaseStats> {
+    return this.knowledgeBase.getStats();
   }
 
   /**
    * Create a secure communication channel
    */
-  @callable({ description: "Create a secure communication channel" })
-  async createSecureChannel(params: {
-    participants: string[];
-    encryptionAlgorithm?: "AES-256-GCM" | "ChaCha20-Poly1305";
-    integrityAlgorithm?: "SHA-256" | "SHA-384" | "SHA-512";
-    token: string;
-  }): Promise<{ success: boolean; message: string; channelId?: string }> {
-    try {
-      // Record secure channel creation attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "create_secure_channel" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "create_secure_channel_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "create_secure_channel_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to create secure channels"
-        };
-      }
-
-      // Create secure channel
-      const result = await this.secureComm.createChannel({
-        participants: params.participants,
-        encryptionAlgorithm: params.encryptionAlgorithm,
-        integrityAlgorithm: params.integrityAlgorithm,
-        creator: tokenValidation.userId || "unknown"
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "create_secure_channel_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "create_secure_channel_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Secure channel created for participants: ${params.participants.join(", ")}`,
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "created" : "error",
-          participants: params.participants
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "Create a secure communication channel"
+  })
+  private async createSecureChannel(
+    participant1: string,
+    participant2: string
+  ): Promise<SecureChannelResult> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "create_secure_channel_error" }
+        labels: { operation: "create_secure_channel_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to create secure channel",
-        "SECURE_CHANNEL_CREATE_FAILED",
-        "communication",
-        "high",
-        { participants: params.participants }
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to create secure channel: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "create_secure_channel_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to create secure channels"
+      };
+    }
+
+    // Create secure channel
+    const result = await this.secureComm.createChannel({
+      participants: params.participants,
+      encryptionAlgorithm: params.encryptionAlgorithm,
+      integrityAlgorithm: params.integrityAlgorithm,
+      creator: tokenValidation.userId || "unknown"
+    });
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "create_secure_channel_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "create_secure_channel_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: `Secure channel created for participants: ${params.participants.join(", ")}`,
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "created" : "error",
+        participants: params.participants
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * Close a secure communication channel
    */
-  @callable({ description: "Close a secure communication channel" })
-  async closeSecureChannel(params: {
-    channelId: string;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Record secure channel closing attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "close_secure_channel" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "close_secure_channel_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "close_secure_channel_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to close secure channels"
-        };
-      }
-
-      // Close secure channel
-      const result = await this.secureComm.closeChannel({
-        channelId: params.channelId,
-        closer: tokenValidation.userId || "unknown"
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "close_secure_channel_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "close_secure_channel_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Secure channel closed: ${params.channelId}`,
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "closed" : "error",
-          channelId: params.channelId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "Close a secure communication channel"
+  })
+  private async closeSecureChannel(
+    channelId: string
+  ): Promise<SecureChannelResult> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "close_secure_channel_error" }
+        labels: { operation: "close_secure_channel_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to close secure channel",
-        "SECURE_CHANNEL_CLOSE_FAILED",
-        "communication",
-        "high",
-        { channelId: params.channelId }
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to close secure channel: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "close_secure_channel_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to close secure channels"
+      };
+    }
+
+    // Close secure channel
+    const result = await this.secureComm.closeChannel({
+      channelId: params.channelId,
+      closer: tokenValidation.userId || "unknown"
+    });
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "close_secure_channel_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "close_secure_channel_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: `Secure channel closed: ${params.channelId}`,
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "closed" : "error",
+        channelId: params.channelId
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * Send a secure message
    */
-  @callable({ description: "Send a secure message" })
-  async sendSecureMessage(params: {
-    channelId: string;
-    payload: string;
-    signMessage?: boolean;
-    token: string;
-  }): Promise<{ success: boolean; message: string; messageId?: string }> {
-    try {
-      // Record secure message sending attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "send_secure_message" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "send_secure_message_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "send_secure_message_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to send secure messages"
-        };
-      }
-
-      // Send secure message
-      const result = await this.secureComm.sendMessage({
-        channelId: params.channelId,
-        payload: params.payload,
-        sender: tokenValidation.userId || "unknown",
-        signMessage: params.signMessage
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "send_secure_message_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "send_secure_message_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Secure message sent in channel: ${params.channelId}`,
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "sent" : "error",
-          channelId: params.channelId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "Send a secure message"
+  })
+  private async sendSecureMessage(
+    channelId: string,
+    message: string,
+    metadata?: Record<string, unknown>
+  ): Promise<SecureMessageResult> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "send_secure_message_error" }
+        labels: { operation: "send_secure_message_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to send secure message",
-        "SECURE_MESSAGE_SEND_FAILED",
-        "communication",
-        "high",
-        { channelId: params.channelId }
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to send secure message: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "send_secure_message_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to send secure messages"
+      };
+    }
+
+    // Send secure message
+    const result = await this.secureComm.sendMessage({
+      channelId: params.channelId,
+      payload: params.payload,
+      sender: tokenValidation.userId || "unknown",
+      signMessage: params.signMessage
+    });
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "send_secure_message_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "send_secure_message_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: `Secure message sent in channel: ${params.channelId}`,
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "sent" : "error",
+        channelId: params.channelId
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * Receive a secure message
    */
-  @callable({ description: "Receive a secure message" })
-  async receiveSecureMessage(params: {
-    messageId: string;
-    channelId: string;
-    token: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    secureMessage?: SecureMessage;
-  }> {
-    try {
-      // Record secure message receiving attempt
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "receive_secure_message" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "receive_secure_message_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "receive_secure_message_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to receive secure messages"
-        };
-      }
-
-      // Receive secure message
-      const result = await this.secureComm.receiveMessage({
-        messageId: params.messageId,
-        channelId: params.channelId,
-        recipient: tokenValidation.userId || "unknown"
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "receive_secure_message_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "receive_secure_message_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Secure message received in channel: ${params.channelId}`,
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "received" : "error",
-          channelId: params.channelId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "Receive a secure message"
+  })
+  private async receiveSecureMessage(
+    channelId: string
+  ): Promise<SecureMessageResult> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "receive_secure_message_error" }
+        labels: { operation: "receive_secure_message_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to receive secure message",
-        "SECURE_MESSAGE_RECEIVE_FAILED",
-        "communication",
-        "high",
-        { channelId: params.channelId, messageId: params.messageId }
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to receive secure message: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "receive_secure_message_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to receive secure messages"
+      };
+    }
+
+    // Receive secure message
+    const result = await this.secureComm.receiveMessage({
+      messageId: params.messageId,
+      channelId: params.channelId,
+      recipient: tokenValidation.userId || "unknown"
+    });
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "receive_secure_message_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "receive_secure_message_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: `Secure message received in channel: ${params.channelId}`,
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "received" : "error",
+        channelId: params.channelId
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * Get channel information
    */
-  @callable({ description: "Get channel information" })
-  async getChannelInfo(params: { channelId: string; token: string }): Promise<{
-    success: boolean;
-    message: string;
-    channel?: Omit<SecureChannel, "encryptionAlgorithm" | "integrityAlgorithm">;
-  }> {
-    try {
-      // Record channel info request
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "get_channel_info" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_channel_info_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_channel_info_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to get channel information"
-        };
-      }
-
-      // Get channel information
-      const result = await this.secureComm.getChannelInfo({
-        channelId: params.channelId,
-        requester: tokenValidation.userId || "unknown"
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "get_channel_info_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "get_channel_info_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Channel information retrieved: ${params.channelId}`,
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "retrieved" : "error",
-          channelId: params.channelId
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "Get channel information"
+  })
+  private async getChannelInfo(channelId: string): Promise<SecureChannelInfo> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "get_channel_info_error" }
+        labels: { operation: "get_channel_info_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve channel information",
-        "CHANNEL_INFO_RETRIEVAL_FAILED",
-        "communication",
-        "medium",
-        { channelId: params.channelId }
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to retrieve channel information: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "get_channel_info_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to get channel information"
+      };
+    }
+
+    // Get channel information
+    const result = await this.secureComm.getChannelInfo({
+      channelId: params.channelId,
+      requester: tokenValidation.userId || "unknown"
+    });
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "get_channel_info_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "get_channel_info_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: `Channel information retrieved: ${params.channelId}`,
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "retrieved" : "error",
+        channelId: params.channelId
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * List active channels for a participant
    */
-  @callable({ description: "List active channels for a participant" })
-  async listSecureChannels(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    channels?: Omit<
-      SecureChannel,
-      "encryptionAlgorithm" | "integrityAlgorithm"
-    >[];
-  }> {
-    try {
-      // Record channels listing request
-      await this.monitoring.incrementCounter({
-        metricId: "requests_total",
-        incrementBy: 1,
-        labels: { operation: "list_secure_channels" }
-      });
-
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_secure_channels_auth_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_secure_channels_permission_failure" }
-        });
-
-        return {
-          success: false,
-          message: "Insufficient permissions to list secure channels"
-        };
-      }
-
-      // List secure channels
-      const result = await this.secureComm.listChannels({
-        participant: tokenValidation.userId || "unknown"
-      });
-
-      // Record result
-      if (result.success) {
-        await this.monitoring.incrementCounter({
-          metricId: "requests_total",
-          incrementBy: 1,
-          labels: { operation: "list_secure_channels_success" }
-        });
-      } else {
-        await this.monitoring.incrementCounter({
-          metricId: "errors_total",
-          incrementBy: 1,
-          labels: { operation: "list_secure_channels_failure" }
-        });
-      }
-
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Secure channels listed",
-        payload: {
-          url: "secure-communication",
-          transport: "internal",
-          state: result.success ? "listed" : "error"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
+  @callable({
+    description: "List active channels for a participant"
+  })
+  private async listActiveChannels(
+    participant: string
+  ): Promise<SecureChannelListResult> {
+    // Validate token
+    const tokenValidation = await this.auth.validateToken({
+      token: params.token
+    });
+    if (!tokenValidation.success) {
       await this.monitoring.incrementCounter({
         metricId: "errors_total",
         incrementBy: 1,
-        labels: { operation: "list_secure_channels_error" }
+        labels: { operation: "list_active_channels_auth_failure" }
       });
-
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to list secure channels",
-        "SECURE_CHANNELS_LIST_FAILED",
-        "communication",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
 
       return {
         success: false,
-        message: "Failed to list secure channels: Internal error"
+        message: "Invalid or expired token"
       };
     }
+
+    // Check permissions
+    if (!tokenValidation.permissions?.includes("master-control")) {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "list_active_channels_permission_failure" }
+      });
+
+      return {
+        success: false,
+        message: "Insufficient permissions to list secure channels"
+      };
+    }
+
+    // List secure channels
+    const result = await this.secureComm.listActiveChannels(
+      tokenValidation.userId || "unknown"
+    );
+
+    // Record result
+    if (result.success) {
+      await this.monitoring.incrementCounter({
+        metricId: "requests_total",
+        incrementBy: 1,
+        labels: { operation: "list_active_channels_success" }
+      });
+    } else {
+      await this.monitoring.incrementCounter({
+        metricId: "errors_total",
+        incrementBy: 1,
+        labels: { operation: "list_active_channels_failure" }
+      });
+    }
+
+    this.observability?.emit({
+      type: "mcp:client:connect",
+      id: this.generateId(),
+      displayMessage: "Secure channels listed",
+      payload: {
+        url: "secure-communication",
+        transport: "internal",
+        state: result.success ? "listed" : "error"
+      },
+      timestamp: Date.now()
+    });
+
+    return result;
   }
 
   /**
    * Record a metric value
    */
   @callable({ description: "Record a metric value" })
-  async recordMetric(params: {
-    metricId: string;
-    value: number;
-    labels?: Record<string, string>;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to record metrics"
-        };
-      }
-
-      // Record metric through monitoring system
-      const result = await this.monitoring.recordMetric(params);
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to record metric",
-        "METRIC_RECORDING_FAILED",
-        "monitoring",
-        "medium",
-        { metricId: params.metricId }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to record metric: Internal error"
-      };
-    }
+  private async recordMetric(
+    name: string,
+    value: number,
+    tags?: Record<string, string>
+  ): Promise<MonitoringResult> {
+    return this.monitoring.recordMetric(name, value, tags);
   }
 
   /**
    * Get a metric value
    */
   @callable({ description: "Get a metric value" })
-  async getMetric(params: { metricId: string; token: string }): Promise<{
-    success: boolean;
-    message: string;
-    metric?: Metric;
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get metrics"
-        };
-      }
-
-      // Get metric through monitoring system
-      const result = await this.monitoring.getMetric(params);
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve metric",
-        "METRIC_RETRIEVAL_FAILED",
-        "monitoring",
-        "medium",
-        { metricId: params.metricId }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve metric: Internal error"
-      };
-    }
+  private async getMetric(
+    name: string,
+    tags?: Record<string, string>
+  ): Promise<MetricResult> {
+    return this.monitoring.getMetric(name, tags);
   }
 
   /**
    * List all metrics
    */
   @callable({ description: "List all metrics" })
-  async listMetrics(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    metrics?: Metric[];
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to list metrics"
-        };
-      }
-
-      // List metrics through monitoring system
-      const result = await this.monitoring.listMetrics();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve metrics",
-        "METRICS_LIST_FAILED",
-        "monitoring",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve metrics: Internal error"
-      };
-    }
+  private async listMetrics(): Promise<MetricListResult> {
+    return this.monitoring.listMetrics();
   }
 
   /**
    * Get recent logs
    */
   @callable({ description: "Get recent logs" })
-  async getRecentLogs(params: {
-    limit?: number;
-    level?: "debug" | "info" | "warn" | "error" | "fatal";
-    token: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    logs?: LogEntry[];
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get logs"
-        };
-      }
-
-      // Get logs through monitoring system
-      const result = await this.monitoring.getRecentLogs(params);
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve logs",
-        "LOGS_RETRIEVAL_FAILED",
-        "monitoring",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve logs: Internal error"
-      };
-    }
+  private async getLogs(limit?: number, level?: string): Promise<LogResult> {
+    return this.monitoring.getLogs(limit, level);
   }
 
   /**
    * Get system health status
    */
   @callable({ description: "Get system health status" })
-  async getSystemHealth(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    health?: {
-      status: "healthy" | "degraded" | "unhealthy";
-      uptime: number;
-      activeAlerts: number;
-      errorRate: number;
-      lastUpdated: number;
-    };
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get system health"
-        };
-      }
-
-      // Get system health through monitoring system
-      const result = await this.monitoring.getSystemHealth();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve system health",
-        "SYSTEM_HEALTH_RETRIEVAL_FAILED",
-        "monitoring",
-        "high"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve system health: Internal error"
-      };
-    }
+  private async getHealthStatus(): Promise<HealthCheckResult> {
+    return this.monitoring.getHealthStatus();
   }
 
   /**
    * Get configuration value
    */
   @callable({ description: "Get configuration value" })
-  async getConfigValue(params: {
-    section: ConfigSection;
-    key: string;
-    token: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    value?: any;
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get configuration values"
-        };
-      }
-
-      // Get configuration value through config manager
-      const result = await this.configManager.getConfigValue(params);
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve configuration value",
-        "CONFIG_VALUE_RETRIEVAL_FAILED",
-        "configuration",
-        "medium",
-        { section: params.section, key: params.key }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve configuration value: Internal error"
-      };
-    }
+  private async getConfig(key: string): Promise<ConfigValueResult> {
+    return this.config.get(key);
   }
 
   /**
    * Set configuration value
    */
   @callable({ description: "Set configuration value" })
-  async setConfigValue(params: {
-    section: ConfigSection;
-    key: string;
-    value: any;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to set configuration values"
-        };
-      }
-
-      // Set configuration value through config manager
-      const result = await this.configManager.setConfigValue(params);
-
-      // Log the configuration change
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Configuration value set: ${params.section}.${params.key}`,
-        payload: {
-          url: "configuration",
-          transport: "internal",
-          state: result.success ? "set" : "error",
-          section: params.section,
-          key: params.key,
-          value: params.value
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to set configuration value",
-        "CONFIG_VALUE_SET_FAILED",
-        "configuration",
-        "medium",
-        { section: params.section, key: params.key }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to set configuration value: Internal error"
-      };
-    }
+  private async setConfig(key: string, value: unknown): Promise<ConfigResult> {
+    return this.config.set(key, value);
   }
 
   /**
    * Get entire configuration section
    */
   @callable({ description: "Get entire configuration section" })
-  async getConfigSection(params: {
-    section: ConfigSection;
-    token: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    config?: Record<string, any>;
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get configuration sections"
-        };
-      }
-
-      // Get configuration section through config manager
-      const result = await this.configManager.getConfigSection(params);
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve configuration section",
-        "CONFIG_SECTION_RETRIEVAL_FAILED",
-        "configuration",
-        "medium",
-        { section: params.section }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve configuration section: Internal error"
-      };
-    }
+  private async getConfigSection(
+    section: string
+  ): Promise<ConfigSectionResult> {
+    return this.config.getSection(section);
   }
 
   /**
    * Set entire configuration section
    */
   @callable({ description: "Set entire configuration section" })
-  async setConfigSection(params: {
-    section: ConfigSection;
-    config: Record<string, any>;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to set configuration sections"
-        };
-      }
-
-      // Set configuration section through config manager
-      const result = await this.configManager.setConfigSection(params);
-
-      // Log the configuration change
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: `Configuration section set: ${params.section}`,
-        payload: {
-          url: "configuration",
-          transport: "internal",
-          state: result.success ? "set" : "error",
-          section: params.section
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to set configuration section",
-        "CONFIG_SECTION_SET_FAILED",
-        "configuration",
-        "medium",
-        { section: params.section }
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to set configuration section: Internal error"
-      };
-    }
+  private async setConfigSection(
+    section: string,
+    values: Record<string, unknown>
+  ): Promise<ConfigResult> {
+    return this.config.setSection(section, values);
   }
 
   /**
    * Get entire configuration
    */
   @callable({ description: "Get entire configuration" })
-  async getFullConfig(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    config?: MasterControlConfig;
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get full configuration"
-        };
-      }
-
-      // Get full configuration through config manager
-      const result = await this.configManager.getFullConfig();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve full configuration",
-        "FULL_CONFIG_RETRIEVAL_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve full configuration: Internal error"
-      };
-    }
+  private async getAllConfig(): Promise<ConfigAllResult> {
+    return this.config.getAll();
   }
 
   /**
    * Update configuration from object
    */
   @callable({ description: "Update configuration from object" })
-  async updateConfig(params: {
-    config: Partial<MasterControlConfig>;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to update configuration"
-        };
-      }
-
-      // Update configuration through config manager
-      const result = await this.configManager.updateConfig(params);
-
-      // Log the configuration change
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Configuration updated",
-        payload: {
-          url: "configuration",
-          transport: "internal",
-          state: result.success ? "updated" : "error"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to update configuration",
-        "CONFIG_UPDATE_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to update configuration: Internal error"
-      };
-    }
+  private async updateConfig(
+    updates: Record<string, unknown>
+  ): Promise<ConfigResult> {
+    return this.config.update(updates);
   }
 
   /**
    * Reset configuration to defaults
    */
   @callable({ description: "Reset configuration to defaults" })
-  async resetConfig(params: {
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to reset configuration"
-        };
-      }
-
-      // Reset configuration through config manager
-      const result = await this.configManager.resetConfig();
-
-      // Log the configuration change
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Configuration reset to defaults",
-        payload: {
-          url: "configuration",
-          transport: "internal",
-          state: result.success ? "reset" : "error"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to reset configuration",
-        "CONFIG_RESET_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to reset configuration: Internal error"
-      };
-    }
+  private async resetConfig(): Promise<ConfigResult> {
+    return this.config.reset();
   }
 
   /**
    * Validate configuration
    */
   @callable({ description: "Validate configuration" })
-  async validateConfig(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    errors?: string[];
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to validate configuration"
-        };
-      }
-
-      // Validate configuration through config manager
-      const result = await this.configManager.validateConfig();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to validate configuration",
-        "CONFIG_VALIDATION_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to validate configuration: Internal error"
-      };
-    }
+  private async validateConfig(): Promise<ConfigValidationResult> {
+    return this.config.validate();
   }
 
   /**
    * Get configuration metadata
    */
   @callable({ description: "Get configuration metadata" })
-  async getConfigMetadata(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    metadata?: {
-      version: string;
-      lastUpdated: number;
-      sections: ConfigSection[];
-    };
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get configuration metadata"
-        };
-      }
-
-      // Get configuration metadata through config manager
-      const result = await this.configManager.getConfigMetadata();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve configuration metadata",
-        "CONFIG_METADATA_RETRIEVAL_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve configuration metadata: Internal error"
-      };
-    }
+  private async getConfigMetadata(key: string): Promise<ConfigMetadataResult> {
+    return this.config.getMetadata(key);
   }
 
   /**
    * Export configuration to JSON
    */
   @callable({ description: "Export configuration to JSON" })
-  async exportConfig(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    json?: string;
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to export configuration"
-        };
-      }
-
-      // Export configuration through config manager
-      const result = await this.configManager.exportConfig();
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to export configuration",
-        "CONFIG_EXPORT_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to export configuration: Internal error"
-      };
-    }
+  private async exportConfig(): Promise<ConfigExportResult> {
+    return this.config.export();
   }
 
   /**
    * Import configuration from JSON
    */
   @callable({ description: "Import configuration from JSON" })
-  async importConfig(params: {
-    json: string;
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("configuration")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to import configuration"
-        };
-      }
-
-      // Import configuration through config manager
-      const result = await this.configManager.importConfig(params);
-
-      // Log the configuration change
-      this.observability?.emit({
-        type: "mcp:client:connect",
-        id: this.generateId(),
-        displayMessage: "Configuration imported from JSON",
-        payload: {
-          url: "configuration",
-          transport: "internal",
-          state: result.success ? "imported" : "error"
-        },
-        timestamp: Date.now()
-      });
-
-      return result;
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to import configuration",
-        "CONFIG_IMPORT_FAILED",
-        "configuration",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to import configuration: Internal error"
-      };
-    }
+  private async importConfig(json: string): Promise<ConfigResult> {
+    return this.config.import(json);
   }
 
   /**
    * Get recent errors
    */
   @callable({ description: "Get recent errors" })
-  async getRecentErrors(params: {
-    limit?: number;
-    category?: ErrorCategory;
-    severity?: ErrorSeverity;
-    token: string;
-  }): Promise<{
-    success: boolean;
-    message: string;
-    errors?: any[]; // Using any[] to avoid circular dependency issues
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get error logs"
-        };
-      }
-
-      // Get recent errors through error handler
-      const errors = this.errorHandler.getRecentErrors(
-        params.limit,
-        params.category,
-        params.severity
-      );
-
-      return {
-        success: true,
-        message: "Recent errors retrieved successfully",
-        errors: errors as any[] // Cast to any[] to avoid type issues
-      };
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve recent errors",
-        "RECENT_ERRORS_RETRIEVAL_FAILED",
-        "system",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve recent errors: Internal error"
-      };
-    }
+  private async getErrors(limit?: number): Promise<ErrorLogResult> {
+    return this.errorHandler.getErrors(limit);
   }
 
   /**
    * Get error statistics
    */
   @callable({ description: "Get error statistics" })
-  async getErrorStatistics(params: { token: string }): Promise<{
-    success: boolean;
-    message: string;
-    statistics?: any; // Using any to avoid circular dependency issues
-  }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to get error statistics"
-        };
-      }
-
-      // Get error statistics through error handler
-      const statistics = this.errorHandler.getErrorStatistics();
-
-      return {
-        success: true,
-        message: "Error statistics retrieved successfully",
-        statistics: statistics as any // Cast to any to avoid type issues
-      };
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to retrieve error statistics",
-        "ERROR_STATISTICS_RETRIEVAL_FAILED",
-        "system",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to retrieve error statistics: Internal error"
-      };
-    }
+  private async getErrorStats(): Promise<ErrorStatsResult> {
+    return this.errorHandler.getStats();
   }
 
   /**
    * Clear error log
    */
   @callable({ description: "Clear error log" })
-  async clearErrorLog(params: {
-    token: string;
-  }): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate token
-      const tokenValidation = await this.auth.validateToken({
-        token: params.token
-      });
-      if (!tokenValidation.success) {
-        return {
-          success: false,
-          message: "Invalid or expired token"
-        };
-      }
-
-      // Check permissions
-      if (!tokenValidation.permissions?.includes("master-control")) {
-        return {
-          success: false,
-          message: "Insufficient permissions to clear error log"
-        };
-      }
-
-      // Clear error log through error handler
-      this.errorHandler.clearErrorLog();
-
-      return {
-        success: true,
-        message: "Error log cleared successfully"
-      };
-    } catch (error: any) {
-      const masterError = this.errorHandler.createError(
-        error.message || "Failed to clear error log",
-        "ERROR_LOG_CLEAR_FAILED",
-        "system",
-        "medium"
-      );
-
-      await this.errorHandler.handleError(masterError);
-
-      return {
-        success: false,
-        message: "Failed to clear error log: Internal error"
-      };
-    }
+  private async clearErrors(): Promise<ErrorClearResult> {
+    return this.errorHandler.clear();
   }
 
   /**
