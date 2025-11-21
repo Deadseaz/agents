@@ -1790,7 +1790,7 @@ export type EmailRoutingOptions<Env> = AgentOptions<Env> & {
 };
 
 // Cache the agent namespace map for email routing
-// This maps both kebab-case and original names to namespaces
+// This maps both original names and kebab-case versions to namespaces
 const agentMapCache = new WeakMap<
   Record<string, unknown>,
   Record<string, unknown>
@@ -1815,7 +1815,7 @@ export async function routeAgentEmail<Env>(
     return;
   }
 
-  // Build a map that includes both original names and kebab-case versions
+  // Build a map that includes both the original names and kebab-case versions
   if (!agentMapCache.has(env as Record<string, unknown>)) {
     const map: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(env as Record<string, unknown>)) {
@@ -1994,3 +1994,9 @@ export class StreamingResponse {
     this._connection.send(JSON.stringify(response));
   }
 }
+
+export {
+  MasterControlAgent,
+  type SecurityContext,
+  type MasterControlAgentState
+} from "./master-control-agent";
